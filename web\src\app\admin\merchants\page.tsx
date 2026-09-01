@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
   Users,
   Search,
@@ -11,83 +11,73 @@ import {
   CheckCircle2,
   Sparkles,
   Sliders,
-  Plus,
+  RefreshCw,
 } from "lucide-react";
 import { formatCurrency } from "@/lib/utils";
 
 export default function AdminMerchantsPage() {
   const [searchTerm, setSearchTerm] = useState("");
+  const [merchants, setMerchants] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
 
-  const [merchants, setMerchants] = useState([
-    {
-      id: "a0000000-0000-0000-0000-000000000001",
-      name: "GrowthMark Agency",
-      email: "merchant@growthmark.pro",
-      phone: "01711000000",
-      plan: "PRO",
-      walletsCount: 4,
-      volume: 685000,
-      apiKey: "gmpay_live_9f8382c7361a4c9e81b2a9d827f61c34",
-      status: "ACTIVE",
-      joined: "2026-09-01",
-    },
-    {
-      id: "m-2",
-      name: "Dhaka Dropship Hub",
-      email: "admin@dhakadrop.com",
-      phone: "01822334455",
-      plan: "PRO",
-      walletsCount: 6,
-      volume: 430000,
-      apiKey: "gmpay_live_883a9f1234c9e81b2a9d827f61c55",
-      status: "ACTIVE",
-      joined: "2026-08-25",
-    },
-    {
-      id: "m-3",
-      name: "GadgetBD Online",
-      email: "support@gadgetbd.xyz",
-      phone: "01933445566",
-      plan: "BASIC",
-      walletsCount: 2,
-      volume: 290000,
-      apiKey: "gmpay_live_12341234361a4c9e81b2a9d827f61c99",
-      status: "ACTIVE",
-      joined: "2026-08-18",
-    },
-    {
-      id: "m-4",
-      name: "Trendy Fashion Wear",
-      email: "info@trendybangla.com",
-      phone: "01655667788",
-      plan: "FREE",
-      walletsCount: 1,
-      volume: 125000,
-      apiKey: "gmpay_live_77665544361a4c9e81b2a9d827f61c00",
-      status: "ACTIVE",
-      joined: "2026-08-10",
-    },
-  ]);
-
-  const toggleStatus = (id: string) => {
-    setMerchants((prev) =>
-      prev.map((m) =>
-        m.id === id ? { ...m, status: m.status === "ACTIVE" ? "SUSPENDED" : "ACTIVE" } : m
-      )
-    );
+  const fetchMerchants = async () => {
+    try {
+      const res = await fetch("/api/v1/admin/merchants");
+      const data = await res.json();
+      if (data.success) setMerchants(data.data);
+    } catch (err) {
+      console.error("Error fetching merchants", err);
+    } finally {
+      setLoading(false);
+    }
   };
 
-  const changePlan = (id: string, newPlan: string) => {
-    setMerchants((prev) =>
-      prev.map((m) => (m.id === id ? { ...m, plan: newPlan } : m))
-    );
+  useEffect(() => {
+    fetchMerchants();
+  }, []);
+
+  const toggleStatus = async (id: string, currentStatus: string) => {
+    const nextStatus = currentStatus === "ACTIVE" ? "SUSPENDED" : "ACTIVE";
+    try {
+      const res = await fetch("/api/v1/admin/merchants", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ merchant_id: id, status: nextStatus }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setMerchants((prev) =>
+          prev.map((m) => (m.id === id ? { ...m, status: nextStatus } : m))
+        );
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const changePlan = async (id: string, newPlan: string) => {
+    try {
+      const res = await fetch("/api/v1/admin/merchants", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ merchant_id: id, plan_tier: newPlan }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setMerchants((prev) =>
+          prev.map((m) => (m.id === id ? { ...m, plan: newPlan } : m))
+        );
+      }
+    } catch (e) {
+      console.error(e);
+    }
   };
 
   const filtered = merchants.filter(
     (m) =>
-      m.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      m.email.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      m.phone.includes(searchTerm)
+      (m.name || "").toLowerCase().includes(searchTerm.toLowerCase()) ||
+      (m.email || "").toLowerCase().includes(searchTerm.toLowerCase()) ||
+      (m.phone || "").includes(searchTerm)
   );
 
   return (
@@ -102,6 +92,13 @@ export default function AdminMerchantsPage() {
             Manage onboarding, SaaS tier upgrades, API keys, and account suspensions.
           </p>
         </div>
+
+        <button
+          onClick={fetchMerchants}
+          className="p-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 flex items-center gap-2 text-xs"
+        >
+          <RefreshCw className="w-3.5 h-3.5" /> Refresh
+        </button>
       </div>
 
       {/* Search Bar */}
@@ -171,7 +168,7 @@ export default function AdminMerchantsPage() {
                   </td>
                   <td className="p-4 text-right">
                     <button
-                      onClick={() => toggleStatus(m.id)}
+                      onClick={() => toggleStatus(m.id, m.status)}
                       className={`px-3 py-1 rounded-lg text-xs font-semibold border transition-all ${
                         m.status === "ACTIVE"
                           ? "bg-rose-500/10 text-rose-400 border-rose-500/20 hover:bg-rose-500/20"

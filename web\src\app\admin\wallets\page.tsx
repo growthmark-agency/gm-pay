@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
   Wallet,
   Battery,
@@ -12,83 +12,43 @@ import {
 import { formatCurrency } from "@/lib/utils";
 
 export default function AdminGlobalWalletsPage() {
-  const [wallets] = useState([
-    {
-      id: "w-1",
-      merchant: "GrowthMark Agency",
-      provider: "BKASH",
-      type: "PERSONAL",
-      phone: "01812345678",
-      dailyLimit: 25000,
-      currentDaily: 6500,
-      battery: 94,
-      priority: 1,
-      isActive: true,
-      lastPing: "10s ago",
-    },
-    {
-      id: "w-2",
-      merchant: "GrowthMark Agency",
-      provider: "BKASH",
-      type: "PERSONAL",
-      phone: "01798765432",
-      dailyLimit: 25000,
-      currentDaily: 0,
-      battery: 88,
-      priority: 2,
-      isActive: true,
-      lastPing: "2m ago",
-    },
-    {
-      id: "w-3",
-      merchant: "Dhaka Dropship Hub",
-      provider: "BKASH",
-      type: "PERSONAL",
-      phone: "01755443322",
-      dailyLimit: 25000,
-      currentDaily: 24200,
-      battery: 42,
-      priority: 1,
-      isActive: true,
-      lastPing: "1m ago",
-    },
-    {
-      id: "w-4",
-      merchant: "Dhaka Dropship Hub",
-      provider: "BKASH",
-      type: "PERSONAL",
-      phone: "01711223344",
-      dailyLimit: 25000,
-      currentDaily: 1200,
-      battery: 95,
-      priority: 2,
-      isActive: true,
-      lastPing: "1m ago",
-    },
-    {
-      id: "w-5",
-      merchant: "GrowthMark Agency",
-      provider: "NAGAD",
-      type: "PERSONAL",
-      phone: "01612345678",
-      dailyLimit: 50000,
-      currentDaily: 3400,
-      battery: 91,
-      priority: 1,
-      isActive: true,
-      lastPing: "30s ago",
-    },
-  ]);
+  const [wallets, setWallets] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  const fetchWallets = async () => {
+    try {
+      const res = await fetch("/api/v1/admin/wallets");
+      const data = await res.json();
+      if (data.success) setWallets(data.data);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchWallets();
+  }, []);
 
   return (
     <div className="p-6 md:p-8 space-y-8 max-w-7xl mx-auto">
-      <div>
-        <h1 className="text-2xl font-black tracking-tight text-white flex items-center gap-2">
-          Global SIM & Wallet Telemetry
-        </h1>
-        <p className="text-slate-400 text-sm mt-1">
-          Live monitoring of all merchant SIM cards, daily limits, battery health, and failover states.
-        </p>
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-black tracking-tight text-white flex items-center gap-2">
+            Global SIM & Wallet Telemetry
+          </h1>
+          <p className="text-slate-400 text-sm mt-1">
+            Live monitoring of all merchant SIM cards, daily limits, battery health, and failover states.
+          </p>
+        </div>
+
+        <button
+          onClick={fetchWallets}
+          className="p-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-800 flex items-center gap-2 text-xs"
+        >
+          <RefreshCw className="w-3.5 h-3.5" /> Refresh
+        </button>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
