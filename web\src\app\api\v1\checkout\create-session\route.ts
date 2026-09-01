@@ -1,51 +1,74 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db } from "@/lib/store";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 import crypto from "crypto";
 
 export async function POST(req: NextRequest) {
   try {
     const authHeader = req.headers.get("authorization") || req.headers.get("x-api-key");
-    const body = await req.json();
+    const apiKey = authHeader?.replace("Bearer ", "").trim();
 
+    if (!apiKey) {
+      return NextResponse.json(
+        { success: false, error: "UNAUTHORIZED", message: "API Key is required in Authorization header." },
+        { status: 401 }
+      );
+    }
+
+    // 1. Authenticate Merchant in Supabase
+    const { data: merchant, error: mErr } = await supabaseAdmin
+      .from("merchants")
+      .select("*")
+      .or(`api_key.eq.${apiKey},sandbox_key.eq.${apiKey}`)
+      .limit(1)
+      .single();
+
+    if (mErr || !merchant) {
+      return NextResponse.json(
+        { success: false, error: "INVALID_CREDENTIALS", message: "Invalid API key provided." },
+        { status: 401 }
+      );
+    }
+
+    const body = await req.json();
     const {
       amount,
       order_id,
       customer_name,
       customer_phone,
       customer_email,
-      provider = "BKASH",
+      provider,
       redirect_url,
       cancel_url,
+      currency,
     } = body;
 
-    if (!amount || amount <= 0 || !order_id) {
+    if (!amount || amount <= 0 || !order_id || !provider) {
       return NextResponse.json(
-        { success: false, error: "VALIDATION_ERROR", message: "Invalid amount or order_id" },
+        { success: false, error: "VALIDATION_ERROR", message: "amount, order_id, and provider (BKASH/NAGAD/ROCKET) are required." },
         { status: 400 }
       );
     }
 
-    // Authenticate Merchant
-    const apiKey = authHeader?.replace("Bearer ", "").trim();
-    const merchant = db.merchants.find((m) => m.apiKey === apiKey || m.sandboxKey === apiKey) || db.merchants[0];
+    const cleanProvider = provider.toUpperCase();
 
-    if (!merchant) {
-      return NextResponse.json(
-        { success: false, error: "UNAUTHORIZED", message: "Invalid API Key" },
-        { status: 401 }
-      );
-    }
+    // 2. Select Available SIM Wallet with Auto-Failover (Using Stored Procedure or Query)
+    const { data: availableWallets } = await supabaseAdmin
+      .from("merchant_wallets")
+      .select("*")
+      .eq("merchant_id", merchant.id)
+      .eq("provider", cleanProvider)
+      .eq("is_active", true)
+      .order("priority", { ascending: true })
+      .limit(1);
 
-    // Select Available Wallet with Smart Failover
-    const normalizedProvider = (provider.toUpperCase() as "BKASH" | "NAGAD" | "ROCKET" | "UPAY") || "BKASH";
-    const wallet = db.getAvailableWallet(merchant.id, normalizedProvider, parseFloat(amount));
+    const assignedWallet = availableWallets && availableWallets.length > 0 ? availableWallets[0] : null;
 
-    if (!wallet) {
+    if (!assignedWallet) {
       return NextResponse.json(
         {
           success: false,
-          error: "LIMIT_REACHED",
-          message: `All ${normalizedProvider} wallets have reached daily limits or are inactive. Please contact merchant.`,
+          error: "NO_ACTIVE_WALLET",
+          message: `No active ${cleanProvider} SIM wallet found. Please configure a wallet in your GM Pay dashboard.`,
         },
         { status: 503 }
       );
@@ -54,30 +77,32 @@ export async function POST(req: NextRequest) {
     const sessionId = crypto.randomUUID();
     const expiresAt = new Date(Date.now() + 20 * 60000).toISOString();
 
-    const newSession = {
-      id: sessionId,
-      merchantId: merchant.id,
-      assignedWalletId: wallet.id,
-      orderId: String(order_id),
-      customerName: customer_name || "",
-      customerPhone: customer_phone || "",
-      customerEmail: customer_email || "",
-      amount: parseFloat(amount),
-      currency: "BDT",
-      provider: normalizedProvider,
-      paymentMethod: (wallet.walletType === "MERCHANT" ? "PAYMENT" : "SEND_MONEY") as "SEND_MONEY" | "PAYMENT",
-      status: "PENDING" as const,
-      redirectUrl: redirect_url || "",
-      cancelUrl: cancel_url || "",
-      webhookDelivered: false,
-      webhookAttempts: 0,
-      expiresAt,
-      createdAt: new Date().toISOString(),
-    };
+    // 3. Create Payment Session in Supabase
+    const { data: session, error: sErr } = await supabaseAdmin
+      .from("payment_sessions")
+      .insert({
+        id: sessionId,
+        merchant_id: merchant.id,
+        assigned_wallet_id: assignedWallet.id,
+        order_id: String(order_id),
+        customer_name: customer_name || "",
+        customer_phone: customer_phone || "",
+        customer_email: customer_email || "",
+        amount: parseFloat(amount),
+        currency: currency || "BDT",
+        provider: cleanProvider,
+        payment_method: assignedWallet.wallet_type === "MERCHANT" ? "PAYMENT" : "SEND_MONEY",
+        status: "PENDING",
+        redirect_url: redirect_url || merchant.webhook_url,
+        cancel_url: cancel_url || "",
+        expires_at: expiresAt,
+      })
+      .select()
+      .single();
 
-    db.sessions.unshift(newSession);
+    if (sErr) throw sErr;
 
-    const baseUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
+    const baseUrl = process.env.NEXT_PUBLIC_APP_URL || "https://gmpay.growthmark.pro";
     const checkoutUrl = `${baseUrl}/checkout/${sessionId}`;
 
     return NextResponse.json({
@@ -85,12 +110,12 @@ export async function POST(req: NextRequest) {
       data: {
         session_id: sessionId,
         checkout_url: checkoutUrl,
-        amount: newSession.amount,
-        currency: newSession.currency,
-        order_id: newSession.orderId,
-        provider: newSession.provider,
-        payment_number: wallet.phoneNumber,
-        payment_method: newSession.paymentMethod,
+        amount: parseFloat(amount),
+        currency: currency || "BDT",
+        order_id: String(order_id),
+        provider: cleanProvider,
+        payment_number: assignedWallet.phone_number,
+        payment_method: assignedWallet.wallet_type === "MERCHANT" ? "PAYMENT" : "SEND_MONEY",
         expires_at: expiresAt,
       },
     });

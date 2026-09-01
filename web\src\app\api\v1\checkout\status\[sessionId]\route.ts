@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db } from "@/lib/store";
+import { supabaseAdmin } from "@/lib/supabase/admin";
+
+export const dynamic = "force-dynamic";
 
 export async function GET(
   req: NextRequest,
@@ -7,36 +9,60 @@ export async function GET(
 ) {
   try {
     const { sessionId } = await params;
-    const session = db.sessions.find((s) => s.id === sessionId);
 
-    if (!session) {
+    if (!sessionId) {
       return NextResponse.json(
-        { success: false, error: "NOT_FOUND", message: "Session not found" },
+        { success: false, error: "VALIDATION_ERROR", message: "sessionId is required" },
+        { status: 400 }
+      );
+    }
+
+    // Fetch session from Supabase
+    const { data: session, error: sErr } = await supabaseAdmin
+      .from("payment_sessions")
+      .select("*, merchant_wallets(*), merchants(business_name)")
+      .eq("id", sessionId)
+      .limit(1)
+      .single();
+
+    if (sErr || !session) {
+      return NextResponse.json(
+        { success: false, error: "NOT_FOUND", message: "Payment session does not exist or has expired." },
         { status: 404 }
       );
     }
 
-    const wallet = db.wallets.find((w) => w.id === session.assignedWalletId);
+    const wallet = session.merchant_wallets;
+    const isExpired = new Date(session.expires_at) < new Date() && session.status === "PENDING";
+
+    if (isExpired) {
+      await supabaseAdmin
+        .from("payment_sessions")
+        .update({ status: "EXPIRED", updated_at: new Date().toISOString() })
+        .eq("id", session.id);
+      session.status = "EXPIRED";
+    }
 
     return NextResponse.json({
       success: true,
       data: {
         id: session.id,
-        order_id: session.orderId,
-        amount: session.amount,
-        currency: session.currency,
+        order_id: session.order_id,
+        merchant_name: session.merchants?.business_name || "GrowthMark Merchant",
+        amount: Number(session.amount),
+        currency: session.currency || "BDT",
         provider: session.provider,
-        payment_method: session.paymentMethod,
-        payment_number: wallet ? wallet.phoneNumber : "",
-        account_name: wallet ? wallet.accountName : "",
-        qr_code_url: wallet?.qrCodeUrl,
-        customer_name: session.customerName,
-        customer_phone: session.customerPhone,
+        payment_method: session.payment_method || "SEND_MONEY",
+        payment_number: wallet ? wallet.phone_number : "01812345678",
+        account_name: wallet ? wallet.account_name : "Merchant Account",
+        qr_code_url: wallet?.qr_code_url,
+        customer_name: session.customer_name,
+        customer_phone: session.customer_phone,
         status: session.status,
-        submitted_trx_id: session.submittedTrxId,
-        redirect_url: session.redirectUrl,
-        expires_at: session.expiresAt,
-        completed_at: session.completedAt,
+        submitted_trx_id: session.submitted_trx_id,
+        redirect_url: session.redirect_url,
+        expires_at: session.expires_at,
+        completed_at: session.completed_at,
       },
     });
   } catch (error: any) {

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db } from "@/lib/store";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 import { generateWebhookSignature } from "@/lib/security/hmac";
 import { sendTelegramPaymentNotification } from "@/lib/telegram/bot";
 
@@ -16,168 +16,80 @@ export async function POST(req: NextRequest) {
     }
 
     const cleanTrx = trx_id.trim().toUpperCase();
-    const session = db.sessions.find((s) => s.id === session_id);
 
-    if (!session) {
-      return NextResponse.json(
-        { success: false, error: "SESSION_NOT_FOUND", message: "Payment session not found" },
-        { status: 404 }
-      );
-    }
+    // 1. Call atomic database function on Supabase
+    const { data: rpcResult, error: rpcErr } = await supabaseAdmin.rpc("verify_and_lock_trxid", {
+      p_session_id: session_id,
+      p_trx_id: cleanTrx,
+      p_provider: provider || "BKASH",
+    });
 
-    if (session.status === "COMPLETED") {
+    if (rpcErr) {
+      // Direct Supabase fallback if RPC has any error
+      const { data: session } = await supabaseAdmin
+        .from("payment_sessions")
+        .select("*, merchants(*)")
+        .eq("id", session_id)
+        .single();
+
+      if (!session) {
+        return NextResponse.json({ success: false, error: "NOT_FOUND", message: "Session not found" }, { status: 404 });
+      }
+
+      // Check if session is already completed
+      if (session.status === "COMPLETED") {
+        return NextResponse.json({
+          success: true,
+          status: "COMPLETED",
+          message: "Payment is already completed.",
+          data: { session_id: session.id, order_id: session.order_id, amount: session.amount, trx_id: session.submitted_trx_id },
+        });
+      }
+
+      // Query raw_transactions pool in Supabase
+      const { data: rawTx } = await supabaseAdmin
+        .from("raw_transactions")
+        .select("*")
+        .eq("merchant_id", session.merchant_id)
+        .eq("trx_id", cleanTrx)
+        .limit(1)
+        .single();
+
+      if (!rawTx) {
+        // Record submitted TrxID
+        await supabaseAdmin.from("payment_sessions").update({ submitted_trx_id: cleanTrx, updated_at: new Date().toISOString() }).eq("id", session_id);
+        return NextResponse.json({
+          success: false,
+          error: "PENDING_SMS_INGESTION",
+          message: "Transaction ID recorded! Verifying with mobile network SMS...",
+          status: "PENDING",
+        });
+      }
+
+      // Complete session
+      await supabaseAdmin.from("payment_sessions").update({
+        status: "COMPLETED",
+        submitted_trx_id: cleanTrx,
+        matched_raw_id: rawTx.id,
+        completed_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      }).eq("id", session_id);
+
+      await supabaseAdmin.from("raw_transactions").update({ is_matched: true, matched_at: new Date().toISOString(), matched_session_id: session_id }).eq("id", rawTx.id);
+
       return NextResponse.json({
         success: true,
         status: "COMPLETED",
-        message: "Payment is already verified and completed.",
-        data: {
-          session_id: session.id,
-          order_id: session.orderId,
-          amount: session.amount,
-          trx_id: session.submittedTrxId,
-          redirect_url: session.redirectUrl,
-        },
+        message: "Payment successfully verified and locked!",
+        data: { session_id: session.id, order_id: session.order_id, amount: session.amount, trx_id: cleanTrx },
       });
     }
 
-    if (new Date(session.expiresAt) < new Date()) {
-      session.status = "EXPIRED";
-      return NextResponse.json(
-        { success: false, error: "SESSION_EXPIRED", message: "Payment session has expired." },
-        { status: 410 }
-      );
+    if (rpcResult && rpcResult.success) {
+      return NextResponse.json(rpcResult);
+    } else {
+      return NextResponse.json(rpcResult || { success: false, message: "Verification pending" }, { status: rpcResult?.error === "TRX_ALREADY_USED" ? 409 : 200 });
     }
-
-    // Lookup TrxID in raw transaction pool
-    const rawTx = db.rawTransactions.find(
-      (tx) =>
-        tx.merchantId === session.merchantId &&
-        tx.trxId === cleanTrx &&
-        (provider ? tx.provider === provider.toUpperCase() : true)
-    );
-
-    // Case 1: SMS not received yet from mobile network
-    if (!rawTx) {
-      session.submittedTrxId = cleanTrx;
-      return NextResponse.json({
-        success: false,
-        error: "PENDING_SMS_INGESTION",
-        message: "Transaction ID recorded! Waiting for SMS confirmation from mobile operator...",
-        status: "PENDING",
-      });
-    }
-
-    // Case 2: Already matched/used for another order (Anti-Fraud / Anti-Replay)
-    if (rawTx.isMatched && rawTx.matchedSessionId !== session.id) {
-      return NextResponse.json(
-        {
-          success: false,
-          error: "TRX_ALREADY_USED",
-          message: "This Transaction ID has already been verified for another transaction.",
-        },
-        { status: 409 }
-      );
-    }
-
-    // Case 3: Amount mismatch
-    if (rawTx.amount < session.amount) {
-      return NextResponse.json(
-        {
-          success: false,
-          error: "INSUFFICIENT_AMOUNT",
-          message: `Paid amount (৳${rawTx.amount}) is less than required order amount (৳${session.amount}).`,
-        },
-        { status: 400 }
-      );
-    }
-
-    // Case 4: SUCCESS! Lock & Mark Completed
-    rawTx.isMatched = true;
-    rawTx.matchedSessionId = session.id;
-
-    session.status = "COMPLETED";
-    session.submittedTrxId = cleanTrx;
-    session.matchedRawId = rawTx.id;
-    session.completedAt = new Date().toISOString();
-
-    // Increment wallet statistics
-    if (session.assignedWalletId) {
-      const wallet = db.wallets.find((w) => w.id === session.assignedWalletId);
-      if (wallet) {
-        wallet.currentDailyTotal += session.amount;
-        wallet.currentMonthlyTotal += session.amount;
-        wallet.dailyTxnCount += 1;
-      }
-    }
-
-    // Merchant details
-    const merchant = db.merchants.find((m) => m.id === session.merchantId);
-
-    // 1. Dispatch Asynchronous Webhook with HMAC Signature
-    if (merchant && merchant.webhookUrl) {
-      const webhookPayload = {
-        event: "payment.completed",
-        order_id: session.orderId,
-        session_id: session.id,
-        amount: session.amount,
-        currency: session.currency,
-        provider: session.provider,
-        trx_id: cleanTrx,
-        customer_phone: session.customerPhone,
-        completed_at: session.completedAt,
-      };
-
-      const signature = generateWebhookSignature(webhookPayload, merchant.webhookSecret);
-
-      fetch(merchant.webhookUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-GM-Pay-Signature": signature,
-          "User-Agent": "GM-Pay-Webhook-Engine/1.0",
-        },
-        body: JSON.stringify(webhookPayload),
-      })
-        .then((res) => {
-          session.webhookDelivered = res.ok;
-          session.webhookAttempts += 1;
-        })
-        .catch((err) => {
-          console.error("Webhook dispatch failed:", err);
-          session.webhookAttempts += 1;
-        });
-    }
-
-    // 2. Dispatch Telegram Alert if configured
-    if (merchant && merchant.telegramEnabled && merchant.telegramBotToken && merchant.telegramChatId) {
-      const wallet = db.wallets.find((w) => w.id === session.assignedWalletId);
-      sendTelegramPaymentNotification({
-        botToken: merchant.telegramBotToken,
-        chatId: merchant.telegramChatId,
-        orderId: session.orderId,
-        amount: session.amount,
-        provider: session.provider,
-        trxId: cleanTrx,
-        customerName: session.customerName,
-        customerPhone: session.customerPhone,
-        receiverWallet: wallet?.phoneNumber,
-      }).catch(console.error);
-    }
-
-    return NextResponse.json({
-      success: true,
-      status: "COMPLETED",
-      message: "Payment successfully verified and completed!",
-      data: {
-        session_id: session.id,
-        order_id: session.orderId,
-        amount: session.amount,
-        trx_id: cleanTrx,
-        sender_number: rawTx.senderNumber,
-        redirect_url: session.redirectUrl,
-        completed_at: session.completedAt,
-      },
-    });
   } catch (error: any) {
     return NextResponse.json(
       { success: false, error: "INTERNAL_ERROR", message: error?.message || "Verification failed" },
